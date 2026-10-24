@@ -14,6 +14,7 @@ YuriLive 一起听/看 服务端
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -73,11 +74,14 @@ async def broadcast_count():
 
 
 @app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket, key: str = ""):
+async def ws_endpoint(ws: WebSocket, key: str = "", name: str = ""):
     role = "host" if key and key == HOST_KEY else "guest"
     await ws.accept()
     clients.add(ws)
-    name = "主持人" if role == "host" else "观众-" + uuid.uuid4().hex[:4]
+    if role == "host":
+        name = "主持人"
+    else:
+        name = re.sub(r"[\s,]", "", name)[:24] or "观众-" + uuid.uuid4().hex[:4]
     await ws.send_json({"t": "hello", "role": role, "name": name, "state": dict(state)})
     await broadcast_count()
     try:
@@ -99,6 +103,17 @@ async def ws_endpoint(ws: WebSocket, key: str = ""):
     finally:
         clients.discard(ws)
         await broadcast_count()
+
+
+# 服务端心跳: 25s 广播一次, 防微信webview/运营商NAT静默断连WS
+@app.on_event("startup")
+async def _ws_keepalive():
+    async def loop():
+        while True:
+            await asyncio.sleep(25)
+            await broadcast({"t": "hb"})
+
+    asyncio.create_task(loop())
 
 
 # ---------------- 视频清单与上传 ----------------
@@ -245,48 +260,42 @@ def fetch_status(job_id: str):
     return j
 
 
-# ---------------- Range 视频流 ----------------
+# ---------------- Range 媒体流(视频/纯音频) ----------------
+
+AUDIO_CACHE = (BASE / "audio_cache").resolve()
+AUDIO_CACHE.mkdir(exist_ok=True)
 
 
-@app.get("/media/{full_path:path}")
-def media(full_path: str, range: str = Header(default="")):
-    root = MEDIA_ROOT
-    target = (root / full_path).resolve()
-    if not str(target).startswith(str(root)) or not target.is_file():
-        return JSONResponse({"error": "not found"}, status_code=404)
+def _range_stream(target: Path, ctype: str, range: str):
+    """统一的 Range 字节流响应(视频/音频通用)"""
     size = target.stat().st_size
-    start, end = 0, size - 1
+    start_b, end_b = 0, size - 1
     if range.startswith("bytes="):
         try:
             rng = range[6:].split(",")[0].strip()
             if rng.startswith("-"):
-                start = max(size - int(rng[1:]), 0)
+                start_b = max(size - int(rng[1:]), 0)
             else:
                 a, _, b = rng.partition("-")
-                start = int(a)
-                end = int(b) if b else size - 1
+                start_b = int(a)
+                end_b = int(b) if b else size - 1
         except ValueError:
-            start, end = 0, size - 1
-    end = min(end, size - 1)
-    if start > end:
+            start_b, end_b = 0, size - 1
+    end_b = min(end_b, size - 1)
+    if start_b > end_b:
         return JSONResponse({"error": "bad range"}, status_code=416)
-    length = end - start + 1
-    ctype = (
-        "video/mp4"
-        if target.suffix.lower() in (".mp4", ".m4v", ".mov")
-        else "video/webm"
-    )
+    length = end_b - start_b + 1
     headers = {
         "Content-Type": ctype,
         "Accept-Ranges": "bytes",
         "Content-Length": str(length),
-        "Content-Range": f"bytes {start}-{end}/{size}",
+        "Content-Range": f"bytes {start_b}-{end_b}/{size}",
     }
     status = 206 if range else 200
 
     def iterfile():
         with open(target, "rb") as f:
-            f.seek(start)
+            f.seek(start_b)
             remaining = length
             while remaining > 0:
                 chunk = f.read(min(1 << 20, remaining))
@@ -298,6 +307,69 @@ def media(full_path: str, range: str = Header(default="")):
     from fastapi.responses import StreamingResponse
 
     return StreamingResponse(iterfile(), status_code=status, headers=headers)
+
+
+def _resolve_media(full_path: str) -> Path | None:
+    target = (MEDIA_ROOT / full_path).resolve()
+    if not str(target).startswith(str(MEDIA_ROOT)) or not target.is_file():
+        return None
+    return target
+
+
+@app.get("/media/{full_path:path}")
+def media(full_path: str, range: str = Header(default="")):
+    target = _resolve_media(full_path)
+    if target is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    ctype = (
+        "video/mp4"
+        if target.suffix.lower() in (".mp4", ".m4v", ".mov")
+        else "video/webm"
+    )
+    return _range_stream(target, ctype, range)
+
+
+@app.get("/audio/{full_path:path}")
+def audio(full_path: str, range: str = Header(default="")):
+    """纯音频模式: 按需抽取音轨为 m4a 并缓存(首次较慢,之后零成本)。
+    带宽只有视频流的 1/20 左右,弱网救星。"""
+    target = _resolve_media(full_path)
+    if target is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    key = hashlib.md5(f"{target}|{target.stat().st_mtime}".encode()).hexdigest()[:16]
+    out_f = AUDIO_CACHE / f"{key}.m4a"
+    if not out_f.exists():
+        print(f"[yurilive] 抽取音轨: {target.name}", flush=True)
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(target), "-vn", "-c:a", "copy", str(out_f)],
+            capture_output=True,
+            timeout=3600,
+        )
+        if r.returncode != 0 or not out_f.exists() or out_f.stat().st_size == 0:
+            out_f.unlink(missing_ok=True)
+            r = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(target),
+                    "-vn",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "96k",
+                    str(out_f),
+                ],
+                capture_output=True,
+                timeout=7200,
+            )
+            if r.returncode != 0 or not out_f.exists():
+                return JSONResponse({"error": "音轨抽取失败"}, status_code=500)
+        print(
+            f"[yurilive] 音轨就绪: {out_f.name} ({out_f.stat().st_size / 1048576:.0f} MB)",
+            flush=True,
+        )
+    return _range_stream(out_f, "audio/mp4", range)
 
 
 # ---------------- 生产: 托管前端 dist ----------------
