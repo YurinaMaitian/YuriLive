@@ -56,6 +56,7 @@ app = FastAPI(title="YuriLive", version="0.1.0")
 # ---------------- 同步状态 ----------------
 state = {"v": "", "playing": False, "pos": 0.0, "srv_ts": 0.0}
 clients: set = set()
+host_count = 0  # 在线 host 数: 最后一个 host 断开即清空放映状态
 
 
 async def broadcast(msg: dict):
@@ -75,10 +76,12 @@ async def broadcast_count():
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket, key: str = "", name: str = ""):
+    global host_count
     role = "host" if key and key == HOST_KEY else "guest"
     await ws.accept()
     clients.add(ws)
     if role == "host":
+        host_count += 1
         name = "主持人"
     else:
         name = re.sub(r"[\s,]", "", name)[:24] or "观众-" + uuid.uuid4().hex[:4]
@@ -102,6 +105,12 @@ async def ws_endpoint(ws: WebSocket, key: str = "", name: str = ""):
         pass
     finally:
         clients.discard(ws)
+        if role == "host":
+            host_count = max(0, host_count - 1)
+            if host_count == 0:
+                # 没有主持人了: 清空放映状态, 通知所有观众
+                state.update(v="", playing=False, pos=0.0, srv_ts=0.0)
+                await broadcast({"t": "state", **state})
         await broadcast_count()
 
 
